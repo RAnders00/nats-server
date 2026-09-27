@@ -5822,6 +5822,87 @@ func TestJetStreamInterestRetentionKeepLastPerSubjectCount(t *testing.T) {
 	}
 }
 
+func TestJetStreamInterestRetentionKeepLastPerSubjectMultipleConsumers(t *testing.T) {
+	for _, storage := range []StorageType{MemoryStorage, FileStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			mset, err := s.GlobalAccount().addStream(&StreamConfig{
+				Name:               "KEEP_CONSUMERS",
+				Subjects:           []string{"state.>"},
+				Retention:          InterestPolicy,
+				Storage:            storage,
+				KeepLastPerSubject: 1,
+			})
+			require_NoError(t, err)
+			defer mset.delete()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+			fooSub, err := nc.SubscribeSync(nats.NewInbox())
+			require_NoError(t, err)
+			barSub, err := nc.SubscribeSync(nats.NewInbox())
+			require_NoError(t, err)
+			require_NoError(t, nc.Flush())
+			_, err = mset.addConsumer(&ConsumerConfig{
+				DeliverSubject: fooSub.Subject,
+				FilterSubject:  "state.foo",
+				AckPolicy:      AckExplicit,
+			})
+			require_NoError(t, err)
+			_, err = mset.addConsumer(&ConsumerConfig{
+				DeliverSubject: barSub.Subject,
+				FilterSubject:  "state.bar",
+				AckPolicy:      AckExplicit,
+			})
+			require_NoError(t, err)
+
+			publish := func(subject, value string) {
+				t.Helper()
+				_, err := js.Publish(subject, []byte(value))
+				require_NoError(t, err)
+			}
+			publish("state.foo", "foo-1")
+			publish("state.bar", "bar-1")
+
+			fooMsg, err := fooSub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_NoError(t, fooMsg.Respond(nil))
+			_, err = barSub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_NoError(t, nc.Flush())
+
+			// The foo watcher has progressed, but the bar watcher has not.
+			publish("state.foo", "foo-2")
+			fooMsg, err = fooSub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_Equal(t, string(fooMsg.Data), "foo-2")
+			require_NoError(t, nc.Flush())
+
+			checkFor(t, time.Second, 15*time.Millisecond, func() error {
+				var sm StoreMsg
+				if _, err := mset.store.LoadMsg(1, &sm); err != ErrStoreMsgNotFound {
+					return fmt.Errorf("expected acknowledged foo-1 to be removed, got %v", err)
+				}
+				if _, err := mset.store.LoadMsg(2, &sm); err != nil {
+					return fmt.Errorf("expected unacknowledged bar-1 to remain, got %v", err)
+				}
+				return nil
+			})
+
+			publish("state.bar", "bar-2")
+			_, err = barSub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_NoError(t, nc.Flush())
+			var sm StoreMsg
+			if _, err := mset.store.LoadMsg(2, &sm); err != nil {
+				t.Fatalf("expected bar-1 to remain until its watcher acknowledges it: %v", err)
+			}
+		})
+	}
+}
+
 func TestJetStreamInterestRetentionStreamWithFilteredConsumers(t *testing.T) {
 	cases := []struct {
 		name    string
