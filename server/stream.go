@@ -50,26 +50,27 @@ type StreamConfigRequest struct {
 // StreamConfig will determine the name, subjects and retention policy
 // for a given stream. If subjects is empty the name will be used.
 type StreamConfig struct {
-	Name         string           `json:"name"`
-	Description  string           `json:"description,omitempty"`
-	Subjects     []string         `json:"subjects,omitempty"`
-	Retention    RetentionPolicy  `json:"retention"`
-	MaxConsumers int              `json:"max_consumers"`
-	MaxMsgs      int64            `json:"max_msgs"`
-	MaxBytes     int64            `json:"max_bytes"`
-	MaxAge       time.Duration    `json:"max_age"`
-	MaxMsgsPer   int64            `json:"max_msgs_per_subject"`
-	MaxMsgSize   int32            `json:"max_msg_size,omitempty"`
-	Discard      DiscardPolicy    `json:"discard"`
-	Storage      StorageType      `json:"storage"`
-	Replicas     int              `json:"num_replicas"`
-	NoAck        bool             `json:"no_ack,omitempty"`
-	Duplicates   time.Duration    `json:"duplicate_window,omitempty"`
-	Placement    *Placement       `json:"placement,omitempty"`
-	Mirror       *StreamSource    `json:"mirror,omitempty"`
-	Sources      []*StreamSource  `json:"sources,omitempty"`
-	Compression  StoreCompression `json:"compression"`
-	FirstSeq     uint64           `json:"first_seq,omitempty"`
+	Name               string           `json:"name"`
+	Description        string           `json:"description,omitempty"`
+	Subjects           []string         `json:"subjects,omitempty"`
+	Retention          RetentionPolicy  `json:"retention"`
+	KeepLastPerSubject uint64           `json:"keep_last_per_subject,omitempty"`
+	MaxConsumers       int              `json:"max_consumers"`
+	MaxMsgs            int64            `json:"max_msgs"`
+	MaxBytes           int64            `json:"max_bytes"`
+	MaxAge             time.Duration    `json:"max_age"`
+	MaxMsgsPer         int64            `json:"max_msgs_per_subject"`
+	MaxMsgSize         int32            `json:"max_msg_size,omitempty"`
+	Discard            DiscardPolicy    `json:"discard"`
+	Storage            StorageType      `json:"storage"`
+	Replicas           int              `json:"num_replicas"`
+	NoAck              bool             `json:"no_ack,omitempty"`
+	Duplicates         time.Duration    `json:"duplicate_window,omitempty"`
+	Placement          *Placement       `json:"placement,omitempty"`
+	Mirror             *StreamSource    `json:"mirror,omitempty"`
+	Sources            []*StreamSource  `json:"sources,omitempty"`
+	Compression        StoreCompression `json:"compression"`
+	FirstSeq           uint64           `json:"first_seq,omitempty"`
 
 	// Allow applying a subject transform to incoming messages before doing anything else
 	SubjectTransform *SubjectTransformConfig `json:"subject_transform,omitempty"`
@@ -1983,6 +1984,9 @@ func (s *Server) checkStreamCfgLocked(config *StreamConfig, acc *Account, pedant
 	}
 	if cfg.MaxAge != 0 && cfg.MaxAge < 100*time.Millisecond {
 		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("max age needs to be >= 100ms"))
+	}
+	if cfg.KeepLastPerSubject > 0 && cfg.Retention != InterestPolicy {
+		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("keep last per subject requires interest retention"))
 	}
 
 	if cfg.Duplicates == 0 && cfg.Mirror == nil && len(cfg.Sources) == 0 {
@@ -5535,6 +5539,15 @@ func (mset *stream) setupStore(fsCfg *FileStoreConfig, recovering bool) error {
 // for removals.
 // Lock should not be held.
 func (mset *stream) storeUpdates(md, bd int64, seq uint64, subj string) {
+	if md > 0 && seq > 0 && subj != _EMPTY_ {
+		mset.cfgMu.RLock()
+		keepLast := mset.cfg.KeepLastPerSubject
+		mset.cfgMu.RUnlock()
+		if keepLast > 0 {
+			go mset.cleanupSupersededSubjectMsg(seq, subj)
+		}
+	}
+
 	// If we have a single negative update then we will process our consumers for stream pending.
 	// Purge and Store handled separately inside individual calls.
 	if md == -1 && seq > 0 && subj != _EMPTY_ {
@@ -5564,6 +5577,22 @@ func (mset *stream) storeUpdates(md, bd int64, seq uint64, subj string) {
 
 	if mset.jsa != nil {
 		mset.jsa.updateUsage(mset.tier, mset.stype, bd)
+	}
+}
+
+func (mset *stream) cleanupSupersededSubjectMsg(seq uint64, subj string) {
+	keep := mset.cfg.KeepLastPerSubject
+	var sm StoreMsg
+	previousSeq := seq - 1
+	for i := uint64(0); i < keep; i++ {
+		previous, _, err := mset.store.LoadPrevMsg(subj, false, previousSeq, &sm)
+		if err != nil || previous == nil {
+			return
+		}
+		previousSeq = previous.seq - 1
+		if i+1 == keep {
+			mset.ackMsg(nil, previous.seq)
+		}
 	}
 }
 
@@ -7212,9 +7241,10 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	}
 
 	var noInterest bool
+	keepLastPerSubject := mset.cfg.KeepLastPerSubject > 0
 
 	// If we are interest based retention and have no consumers then we can skip.
-	if interestRetention {
+	if interestRetention && !keepLastPerSubject {
 		mset.clsMu.RLock()
 		noInterest = numConsumers == 0 || mset.csl == nil || !mset.csl.HasInterest(subject)
 		mset.clsMu.RUnlock()
@@ -8993,12 +9023,58 @@ func (mset *stream) checkInterestState() {
 	}
 
 	mset.cfgMu.RLock()
-	rp := mset.cfg.Retention
+	rp, keepLast := mset.cfg.Retention, mset.cfg.KeepLastPerSubject
 	mset.cfgMu.RUnlock()
 	// Remove as many messages from the "head" of the stream if there's no interest anymore.
 	if rp == InterestPolicy && asflr != math.MaxUint64 {
-		mset.store.Compact(asflr)
+		if keepLast > 0 {
+			mset.compactInterestKeepLast(asflr, keepLast)
+		} else {
+			mset.store.Compact(asflr)
+		}
 	}
+}
+
+func (mset *stream) compactInterestKeepLast(floor, keep uint64) {
+	store := mset.store
+	var sm StoreMsg
+	for seq := uint64(1); seq < floor; {
+		msg, next, err := store.LoadNextMsg(fwcs, true, seq, &sm)
+		if err != nil || msg == nil || next == 0 {
+			return
+		}
+		seq = next + 1
+		if msg.seq >= floor {
+			return
+		}
+		latest, err := store.LoadLastMsg(msg.subj, &sm)
+		if err == nil && mset.isSubjectTail(msg.subj, msg.seq, latest.seq, keep) {
+			continue
+		}
+		store.RemoveMsg(msg.seq)
+	}
+}
+
+func (mset *stream) isSubjectTail(subj string, seq, latest, keep uint64) bool {
+	if keep == 0 || latest < seq {
+		return false
+	}
+	if latest == seq {
+		return true
+	}
+	var sm StoreMsg
+	current := latest
+	for i := uint64(1); i < keep; i++ {
+		msg, _, err := mset.store.LoadPrevMsg(subj, false, current-1, &sm)
+		if err != nil || msg == nil {
+			return false
+		}
+		if msg.seq == seq {
+			return true
+		}
+		current = msg.seq
+	}
+	return false
 }
 
 func (mset *stream) isInterestRetention() bool {
@@ -9372,6 +9448,15 @@ func (mset *stream) ackMsg(o *consumer, seq uint64) bool {
 
 	// If there's no interest left on this message for all consumers, we can remove it.
 	shouldRemove := mset.noInterest(seq, nil)
+	if shouldRemove && mset.cfg.KeepLastPerSubject > 0 {
+		var sm, last StoreMsg
+		if msg, err := store.LoadMsg(seq, &sm); err == nil {
+			if latest, err := store.LoadLastMsg(msg.subj, &last); err == nil &&
+				mset.isSubjectTail(msg.subj, seq, latest.seq, mset.cfg.KeepLastPerSubject) {
+				shouldRemove = false
+			}
+		}
+	}
 
 	// If nothing else to do.
 	if !shouldRemove {

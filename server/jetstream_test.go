@@ -5582,6 +5582,246 @@ func TestJetStreamInterestRetentionStream(t *testing.T) {
 	}
 }
 
+func TestJetStreamInterestRetentionKeepLastPerSubject(t *testing.T) {
+	for _, storage := range []StorageType{MemoryStorage, FileStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			mset, err := s.GlobalAccount().addStream(&StreamConfig{
+				Name:               "KEEP",
+				Subjects:           []string{"state.>"},
+				Retention:          InterestPolicy,
+				Storage:            storage,
+				KeepLastPerSubject: 1,
+			})
+			require_NoError(t, err)
+			defer mset.delete()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+			for _, value := range []string{"offline-first", "offline-last"} {
+				_, err = js.Publish("state.foo", []byte(value))
+				require_NoError(t, err)
+			}
+			checkFor(t, time.Second, 15*time.Millisecond, func() error {
+				if state := mset.state(); state.Msgs != 1 {
+					return fmt.Errorf("expected one offline latest message, got %d", state.Msgs)
+				}
+				return nil
+			})
+
+			sub, err := nc.SubscribeSync(nats.NewInbox())
+			require_NoError(t, err)
+			require_NoError(t, nc.Flush())
+			_, err = mset.addConsumer(&ConsumerConfig{
+				DeliverSubject: sub.Subject,
+				FilterSubject:  "state.foo",
+				AckPolicy:      AckExplicit,
+			})
+			require_NoError(t, err)
+
+			msg, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_Equal(t, string(msg.Data), "offline-last")
+			require_NoError(t, msg.Respond(nil))
+			_, err = js.Publish("state.foo", []byte("last"))
+			require_NoError(t, err)
+			msg, err = sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_NoError(t, msg.Respond(nil))
+			require_NoError(t, nc.Flush())
+
+			checkFor(t, time.Second, 15*time.Millisecond, func() error {
+				if state := mset.state(); state.Msgs != 1 {
+					return fmt.Errorf("expected one latest message, got %d", state.Msgs)
+				}
+				return nil
+			})
+			var sm StoreMsg
+			last, err := mset.store.LoadLastMsg("state.foo", &sm)
+			require_NoError(t, err)
+			require_Equal(t, string(last.msg), "last")
+		})
+	}
+}
+
+func TestJetStreamInterestRetentionKeepLastPerSubjectOrderedConsumer(t *testing.T) {
+	for _, storage := range []StorageType{MemoryStorage, FileStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			mset, err := s.GlobalAccount().addStream(&StreamConfig{
+				Name:               "ORDERED_KEEP",
+				Subjects:           []string{"state.>"},
+				Retention:          InterestPolicy,
+				Storage:            storage,
+				KeepLastPerSubject: 1,
+			})
+			require_NoError(t, err)
+			defer mset.delete()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+			for subject, values := range map[string][]string{
+				"state.foo": {"foo-first", "foo-last"},
+				"state.bar": {"bar-first", "bar-last"},
+			} {
+				for _, value := range values {
+					_, err = js.Publish(subject, []byte(value))
+					require_NoError(t, err)
+				}
+			}
+
+			sub, err := js.SubscribeSync("state.>", nats.OrderedConsumer(), nats.DeliverLastPerSubject())
+			require_NoError(t, err)
+			defer sub.Unsubscribe()
+			seen := make(map[string]string)
+			for range 2 {
+				msg, err := sub.NextMsg(time.Second)
+				require_NoError(t, err)
+				seen[msg.Subject] = string(msg.Data)
+			}
+			require_Equal(t, seen["state.foo"], "foo-last")
+			require_Equal(t, seen["state.bar"], "bar-last")
+			mset.checkInterestState()
+			checkFor(t, time.Second, 15*time.Millisecond, func() error {
+				if state := mset.state(); state.Msgs != 2 {
+					return fmt.Errorf("interest compaction removed latest values, got %d", state.Msgs)
+				}
+				return nil
+			})
+
+			_, err = js.Publish("state.foo", []byte("current"))
+			require_NoError(t, err)
+			msg, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_Equal(t, string(msg.Data), "current")
+
+			checkFor(t, time.Second, 15*time.Millisecond, func() error {
+				if state := mset.state(); state.Msgs != 2 {
+					return fmt.Errorf("expected one latest message per subject, got %d", state.Msgs)
+				}
+				return nil
+			})
+		})
+	}
+}
+
+func TestJetStreamInterestRetentionKeepLastPerSubjectKVWatch(t *testing.T) {
+	for _, storage := range []StorageType{MemoryStorage, FileStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			mset, err := s.GlobalAccount().addStream(&StreamConfig{
+				Name:               "KV_TEST",
+				Subjects:           []string{"$KV.TEST.>"},
+				Retention:          InterestPolicy,
+				MaxMsgsPer:         2,
+				Storage:            storage,
+				KeepLastPerSubject: 1,
+			})
+			require_NoError(t, err)
+			defer mset.delete()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+			kv, err := js.KeyValue("TEST")
+			require_NoError(t, err)
+			for key, values := range map[string][]string{
+				"foo": {"foo-first", "foo-last"},
+				"bar": {"bar-first", "bar-last"},
+			} {
+				for _, value := range values {
+					_, err = kv.PutString(key, value)
+					require_NoError(t, err)
+				}
+			}
+
+			watch, err := kv.Watch(">")
+			require_NoError(t, err)
+			defer watch.Stop()
+			nextEntry := func() nats.KeyValueEntry {
+				timer := time.NewTimer(time.Second)
+				defer timer.Stop()
+				for {
+					select {
+					case entry := <-watch.Updates():
+						if entry != nil {
+							return entry
+						}
+					case <-timer.C:
+						t.Fatal("timed out waiting for KV watch update")
+						return nil
+					}
+				}
+			}
+			seen := make(map[string]string)
+			for range 2 {
+				entry := nextEntry()
+				seen[entry.Key()] = string(entry.Value())
+			}
+			require_Equal(t, seen["foo"], "foo-last")
+			require_Equal(t, seen["bar"], "bar-last")
+
+			_, err = kv.PutString("foo", "current")
+			require_NoError(t, err)
+			entry := nextEntry()
+			require_Equal(t, entry.Key(), "foo")
+			require_Equal(t, string(entry.Value()), "current")
+
+			checkFor(t, time.Second, 15*time.Millisecond, func() error {
+				if state := mset.state(); state.Msgs != 2 {
+					return fmt.Errorf("expected one latest KV value per key, got %d", state.Msgs)
+				}
+				return nil
+			})
+		})
+	}
+}
+
+func TestJetStreamInterestRetentionKeepLastPerSubjectCount(t *testing.T) {
+	for _, storage := range []StorageType{MemoryStorage, FileStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			mset, err := s.GlobalAccount().addStream(&StreamConfig{
+				Name:               "KEEP_COUNT",
+				Subjects:           []string{"state.>"},
+				Retention:          InterestPolicy,
+				Storage:            storage,
+				KeepLastPerSubject: 2,
+			})
+			require_NoError(t, err)
+			defer mset.delete()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+			for _, value := range []string{"first", "second", "third", "fourth"} {
+				_, err = js.Publish("state.foo", []byte(value))
+				require_NoError(t, err)
+			}
+
+			checkFor(t, time.Second, 15*time.Millisecond, func() error {
+				if state := mset.state(); state.Msgs != 2 {
+					return fmt.Errorf("expected two latest messages, got %d", state.Msgs)
+				}
+				return nil
+			})
+			var sm StoreMsg
+			last, err := mset.store.LoadLastMsg("state.foo", &sm)
+			require_NoError(t, err)
+			require_Equal(t, string(last.msg), "fourth")
+			previous, _, err := mset.store.LoadPrevMsg("state.foo", false, last.seq-1, &sm)
+			require_NoError(t, err)
+			require_Equal(t, string(previous.msg), "third")
+		})
+	}
+}
+
 func TestJetStreamInterestRetentionStreamWithFilteredConsumers(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -23026,6 +23266,13 @@ func TestJetStreamInvalidConfigValues(t *testing.T) {
 	_, err = s.checkStreamCfg(&StreamConfig{Name: "TEST", MaxAge: -time.Second}, acc, false)
 	require_True(t, err != nil)
 	require_Error(t, err, NewJSStreamInvalidConfigError(errors.New("max age can not be negative")))
+	_, err = s.checkStreamCfg(&StreamConfig{Name: "TEST", KeepLastPerSubject: 1}, acc, false)
+	require_True(t, err != nil)
+	require_Error(t, err, NewJSStreamInvalidConfigError(errors.New("keep last per subject requires interest retention")))
+
+	cfg, err := s.checkStreamCfg(&StreamConfig{Name: "TEST", Retention: InterestPolicy, KeepLastPerSubject: 1}, acc, false)
+	require_True(t, err == nil)
+	require_Equal(t, cfg.KeepLastPerSubject, uint64(1))
 
 	scfg := StreamConfig{Name: "TEST"}
 	streamTests := []struct {
